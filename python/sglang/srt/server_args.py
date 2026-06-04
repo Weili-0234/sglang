@@ -559,6 +559,12 @@ class ServerArgs:
     hicache_storage_backend: Optional[str] = None
     hicache_storage_prefetch_policy: str = "best_effort"
     hicache_storage_backend_extra_config: Optional[str] = None
+    # [exp branch fix/hicache-fa3-stream-sync-exp] Opt-in: relax the kernel+FA3-decode
+    # compatibility guard so the `kernel` io backend runs with an FA3 decode backend.
+    # The crash baseline (C0) sets this True with NO fix -> reproduces the FA3 D2H IMA;
+    # the fix arms (stream-sync / GDC / green-context) set it True WITH a fix.
+    # Default False for upstream mergeability. See _resolve_io_decode_attention_compatibility.
+    hicache_kernel_fa3_sync: bool = False
 
     # Hierarchical sparse attention
     enable_hisparse: bool = False
@@ -2899,6 +2905,19 @@ class ServerArgs:
         if effective_decode_backend != "fa3":
             return False
 
+        # [exp] Opt-in relax: keep the kernel io backend WITH FA3 decode. The concurrent
+        # D2H write-back copy is made safe by the stream-sync / GDC / green-context fix
+        # (or, for the C0 crash baseline, left unsafe on purpose to reproduce the IMA).
+        # Pin decode to FA3 explicitly so the on-target full-attention path is exercised.
+        if self.hicache_kernel_fa3_sync:
+            if self.decode_attention_backend is None:
+                self.decode_attention_backend = "fa3"
+            logger.warning(
+                "hicache_kernel_fa3_sync=True: keeping kernel io backend with FA3 decode "
+                "(compatibility guard relaxed; relies on the stream-sync/GDC/green-context fix)."
+            )
+            return False
+
         if self.decode_attention_backend is not None:
             self.hicache_io_backend = "direct"
             logger.warning(
@@ -5063,6 +5082,14 @@ class ServerArgs:
             choices=["direct", "kernel", "kernel_ascend"],
             default=ServerArgs.hicache_io_backend,
             help="The IO backend for KV cache transfer between CPU and GPU",
+        )
+        parser.add_argument(
+            "--hicache-kernel-fa3-sync",
+            action="store_true",
+            help="[exp] Relax the kernel+FA3-decode compatibility guard so the kernel io "
+            "backend runs with an FA3 decode backend. Without a fix this reproduces the "
+            "FA3 D2H illegal-memory-access crash; with the stream-sync/GDC/green-context "
+            "fix it is safe and preserves compute/copy overlap.",
         )
         parser.add_argument(
             "--hicache-mem-layout",
