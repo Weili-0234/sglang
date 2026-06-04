@@ -28,10 +28,16 @@ DTYPE = torch.bfloat16
 # [exp] env-configurable so we can sweep page_size (thesis: single-pass on-SM beats
 # #21631's 2-pass staged at small page_size) and shrink the grid for quick sweeps.
 PAGE_SIZE = int(os.environ.get("BENCH_PAGE_SIZE", "64"))
-_QUICK = os.environ.get("BENCH_QUICK", "0") == "1"
-NUM_LAYERS_LIST = [64] if _QUICK else [16, 24, 32, 40, 48, 56, 64, 72, 80]
-BATCH_PAGES = [4, 16, 64] if _QUICK else [4, 8, 16, 32, 64]
-ELEMENT_DIMS = [1024] if _QUICK else [256, 512, 1024, 2048]
+
+
+def _envlist(name, default):
+    v = os.environ.get(name, "")
+    return [int(x) for x in v.split(",")] if v else default
+
+
+NUM_LAYERS_LIST = _envlist("BENCH_LAYERS", [16, 24, 32, 40, 48, 56, 64, 72, 80])
+BATCH_PAGES = _envlist("BENCH_BATCH_PAGES", [4, 8, 16, 32, 64])
+ELEMENT_DIMS = _envlist("BENCH_ELEMENT_DIMS", [256, 512, 1024, 2048])
 TOTAL_PAGES = max(128, max(BATCH_PAGES) * 2)
 WARMUP = 5
 REP = 25
