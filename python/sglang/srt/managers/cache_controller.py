@@ -317,7 +317,34 @@ class HiCacheController:
             self.stop_event, buffer_count=10, max_buffer_size=100
         )
 
-        self.write_stream = device_module.Stream()
+        # [exp] Strategy A (green-context SM isolation): when SGLANG_HICACHE_GREENCTX_SMS=K
+        # is set, run the D2H write-back on a green-context stream with K dedicated SMs so
+        # the on-SM copy is isolated from the FA3 decode SMs (reduces SM-steal / ITL jitter).
+        greenctx_sms = os.environ.get("SGLANG_HICACHE_GREENCTX_SMS")
+        if greenctx_sms:
+            try:
+                from sgl_kernel import (
+                    create_greenctx_stream_by_value,
+                    get_sm_available,
+                )
+
+                dev = torch.cuda.current_device()
+                total_sm = get_sm_available(dev)
+                k = max(1, min(int(greenctx_sms), total_sm - 1))
+                stream_a, _ = create_greenctx_stream_by_value(k, total_sm - k, dev)
+                self.write_stream = stream_a
+                logger.info(
+                    "[exp] HiCache write_stream = green-context %d/%d SMs (Strategy A)",
+                    k,
+                    total_sm,
+                )
+            except Exception as e:
+                logger.warning(
+                    "[exp] green-context write_stream failed (%s); using plain Stream", e
+                )
+                self.write_stream = device_module.Stream()
+        else:
+            self.write_stream = device_module.Stream()
         self.load_stream = device_module.Stream()
 
         # If a storage backend is provided at startup, treat it as an implicit attach,
