@@ -31,6 +31,9 @@ from sglang.jit_kernel.hicache import (
 from sglang.jit_kernel.hicache import (
     transfer_hicache_one_layer_mla as jit_transfer_hicache_one_layer_mla,
 )
+from sglang.jit_kernel.hicache import (
+    transfer_hicache_all_layer_staged_lf_pf as jit_transfer_hicache_all_layer_staged_lf_pf,
+)
 from sglang.srt.mem_cache.memory_pool import (
     KVCache,
     MambaPool,
@@ -73,6 +76,17 @@ def _hicache_aot_block_quota_kwargs() -> dict:
     cause. Unset => binding default (no behavior change)."""
     bq = os.environ.get("SGLANG_HICACHE_BLOCK_QUOTA")
     return {"block_quota": int(bq)} if bq else {}
+
+
+# [exp] #21631 staged write-back (relayout -> device staging -> cudaMemcpyBatchAsync).
+_WRITE_BACK_STAGING_PAGE_CHUNK = 64
+
+
+def _hicache_staged_writeback_enabled() -> bool:
+    """[exp] SGLANG_HICACHE_STAGED=1 routes the kernel + page_first write-back through
+    #21631's staged path instead of the single-pass on-SM JIT kernel. This is the
+    e2e matrix toggle: NEW (on-SM, default) vs #21631 (staged)."""
+    return os.environ.get("SGLANG_HICACHE_STAGED", "0") == "1"
 
 
 def synchronized(func):
@@ -363,6 +377,28 @@ class MHATokenToKVPoolHost(HostKVCache):
             dtype=torch.uint64,
             device=self.device_pool.device,
         )
+        self._init_write_back_staging_buffers()
+
+    def _init_write_back_staging_buffers(self):
+        # [exp] #21631 staged write-back staging buffers (page_first + env-gated only).
+        self.staging_page_capacity = 0
+        self.staging_k_buffer = None
+        self.staging_v_buffer = None
+        if self.layout != "page_first" or not _hicache_staged_writeback_enabled():
+            return
+        self.staging_page_capacity = _WRITE_BACK_STAGING_PAGE_CHUNK
+        staging_tokens = self.staging_page_capacity * self.page_size
+        self.staging_k_buffer = torch.empty(
+            (staging_tokens, self.layer_num, self.head_num, self.head_dim),
+            dtype=self.dtype,
+            device=self.device_pool.device,
+        )
+        self.staging_v_buffer = torch.empty_like(self.staging_k_buffer)
+        logger.info(
+            "[exp] #21631 staged write-back ENABLED (page_first, staging_pages=%d, staging_tokens=%d)",
+            self.staging_page_capacity,
+            staging_tokens,
+        )
 
     def get_size_per_token(self):
         self.head_num = self.device_pool.head_num
@@ -567,7 +603,21 @@ class MHATokenToKVPoolHost(HostKVCache):
                         **_hicache_aot_block_quota_kwargs(),
                     )
             elif self.layout == "page_first":
-                if self.can_use_jit:
+                if self.can_use_jit and _hicache_staged_writeback_enabled():
+                    # [exp] #21631 staged write-back arm: relayout scattered device KV
+                    # -> contiguous device staging -> cudaMemcpyBatchAsync to host pool.
+                    jit_transfer_hicache_all_layer_staged_lf_pf(
+                        k_ptr_src=device_pool.k_data_ptrs,
+                        v_ptr_src=device_pool.v_data_ptrs,
+                        src_indices=device_indices,
+                        dst_indices=host_indices.cpu(),
+                        staging_k=self.staging_k_buffer,
+                        staging_v=self.staging_v_buffer,
+                        dst_k=self.k_buffer,
+                        dst_v=self.v_buffer,
+                        page_size=self.page_size,
+                    )
+                elif self.can_use_jit:
                     # Use transposed data ptrs so the kernel writes to
                     # [layer, page, item] view with stride layout_dim per token.
                     jit_transfer_hicache_all_layer(
