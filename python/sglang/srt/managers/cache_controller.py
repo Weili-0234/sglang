@@ -14,6 +14,7 @@ limitations under the License.
 """
 
 import logging
+import os
 import threading
 import time
 from queue import Empty, Full, Queue
@@ -694,6 +695,13 @@ class HiCacheController:
                 host_indices.record_stream(self.write_stream)
             if device_indices.is_cuda:
                 device_indices.record_stream(self.write_stream)
+
+        if os.environ.get("SGLANG_HICACHE_FORCE_STREAM_SYNC", "0") == "1":
+            # [exp] PR#20611 naive-sync arm: block the scheduler until the on-SM D2H
+            # back-up completes, serializing it with forward progress (no compute/copy
+            # overlap). Conservative proxy for #20611's bidirectional stream fence
+            # (at least as serializing) -> the overlap-preserving NEW fix should beat it.
+            finish_event.synchronize()
 
         self.ack_write_queue.append(HiCacheAck(start_event, finish_event, op.node_ids))
 
