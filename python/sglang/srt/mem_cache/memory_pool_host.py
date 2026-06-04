@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import abc
 import logging
+import os
 import threading
 from collections import defaultdict
 from dataclasses import dataclass
@@ -63,6 +64,15 @@ if _is_npu:
     from sgl_kernel_npu.kvcacheio import TransferDirection, transfer_kv_dim_exchange
 
 logger = logging.getLogger(__name__)
+
+
+def _hicache_aot_block_quota_kwargs() -> dict:
+    """[exp] SGLANG_HICACHE_BLOCK_QUOTA overrides the AOT transfer block_quota
+    (sgl_kernel binding default = 2). Larger => the on-SM D2H copy kernel grabs
+    more SMs, used to probe SM-conflict vs memory-ordering as the FA3 IMA root
+    cause. Unset => binding default (no behavior change)."""
+    bq = os.environ.get("SGLANG_HICACHE_BLOCK_QUOTA")
+    return {"block_quota": int(bq)} if bq else {}
 
 
 def synchronized(func):
@@ -311,8 +321,26 @@ class MHATokenToKVPoolHost(HostKVCache):
             allocator_type,
         )
         self.element_dim = self.device_pool.head_num * self.device_pool.head_dim
-        self.can_use_jit = _is_cuda and can_use_hicache_jit_kernel(
-            element_size=self.element_dim * self.dtype.itemsize
+        # [exp] SGLANG_HICACHE_DISABLE_JIT=1 forces the AOT sgl_kernel transfer
+        # (transfer_kv_all_layer -> transfer_kernel_impl, st.global.cg) instead of
+        # the interference-limited JIT HiCacheKernel. Used to reproduce the
+        # kernel+FA3-decode IMA on the documented crash locus.
+        self.can_use_jit = (
+            _is_cuda
+            and os.environ.get("SGLANG_HICACHE_DISABLE_JIT", "0") != "1"
+            and can_use_hicache_jit_kernel(
+                element_size=self.element_dim * self.dtype.itemsize
+            )
+        )
+        logger.info(
+            "[exp] HiCache MHA host-pool D2H transfer path = %s "
+            "(can_use_jit=%s, SGLANG_HICACHE_DISABLE_JIT=%s, SGLANG_HICACHE_BLOCK_QUOTA=%s)",
+            "JIT HiCacheKernel (block_quota-limited)"
+            if self.can_use_jit
+            else "AOT transfer_kv_all_layer -> transfer_kernel_impl (st.global.cg)",
+            self.can_use_jit,
+            os.environ.get("SGLANG_HICACHE_DISABLE_JIT", "0"),
+            os.environ.get("SGLANG_HICACHE_BLOCK_QUOTA", "default(2)"),
         )
 
         if self.layout == "page_first":
@@ -536,6 +564,7 @@ class MHATokenToKVPoolHost(HostKVCache):
                         dst_indices=host_indices,
                         item_size=self.token_stride_size,
                         num_layers=self.layer_num,
+                        **_hicache_aot_block_quota_kwargs(),
                     )
             elif self.layout == "page_first":
                 if self.can_use_jit:
@@ -809,8 +838,14 @@ class MLATokenToKVPoolHost(HostKVCache):
             device,
             allocator_type,
         )
-        self.can_use_jit = _is_cuda and can_use_hicache_jit_kernel(
-            element_size=self.kv_cache_dim * self.dtype.itemsize
+        # [exp] SGLANG_HICACHE_DISABLE_JIT=1 forces the AOT sgl_kernel transfer path
+        # (see MHA pool above) to reproduce the kernel+FA3-decode IMA.
+        self.can_use_jit = (
+            _is_cuda
+            and os.environ.get("SGLANG_HICACHE_DISABLE_JIT", "0") != "1"
+            and can_use_hicache_jit_kernel(
+                element_size=self.kv_cache_dim * self.dtype.itemsize
+            )
         )
 
         if self.layout == "page_first" and self.can_use_jit:
