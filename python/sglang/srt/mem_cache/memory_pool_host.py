@@ -630,6 +630,10 @@ class MHATokenToKVPoolHost(HostKVCache):
                         kv_cache_src_stride_bytes=self.token_stride_size,
                         kv_cache_dst_stride_bytes=self.layout_dim,
                         element_size=self.element_dim * self.dtype.itemsize,
+                        # [exp] SGLANG_HICACHE_BLOCK_QUOTA tunes the on-SM write-back's
+                        # SM footprint: lower = fewer SMs stolen from FA3 decode = higher
+                        # decode tok/s (Strategy A in software). Default JIT quota = 2.
+                        **_hicache_aot_block_quota_kwargs(),
                     )
                 else:
                     transfer_kv_all_layer_lf_pf(
