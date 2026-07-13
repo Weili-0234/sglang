@@ -1,6 +1,7 @@
 //! OpenTelemetry tracing integration.
 
 use std::{
+    future::Future,
     sync::{
         atomic::{AtomicBool, Ordering},
         OnceLock,
@@ -38,6 +39,65 @@ static ENABLED: AtomicBool = AtomicBool::new(false);
 static TRACER: OnceLock<SdkTracer> = OnceLock::new();
 static PROVIDER: OnceLock<TracerProvider> = OnceLock::new();
 static ALLOWED_TARGETS: OnceLock<[&'static str; 3]> = OnceLock::new();
+
+const BACKEND_METADATA_HEADERS: [&str; 9] = [
+    "x-morphosis-program-id",
+    "x-morphosis-agent-id",
+    "x-morphosis-turn-index",
+    "x-morphosis-parent-agent-id",
+    "x-morphosis-call-id",
+    "x-morphosis-target-worker",
+    "x-morphosis-program-end",
+    "traceparent",
+    "tracestate",
+];
+
+tokio::task_local! {
+    static FORWARDED_BACKEND_METADATA: Vec<(String, String)>;
+}
+
+/// Copy only the V2 routing identity and W3C trace headers from HTTP ingress.
+pub(crate) fn forwarded_backend_metadata(headers: Option<&HeaderMap>) -> Vec<(String, String)> {
+    let Some(headers) = headers else {
+        return Vec::new();
+    };
+    BACKEND_METADATA_HEADERS
+        .iter()
+        .filter_map(|key| {
+            headers
+                .get(*key)
+                .and_then(|value| value.to_str().ok())
+                .map(|value| ((*key).to_string(), value.to_string()))
+        })
+        .collect()
+}
+
+/// Make request-specific metadata visible to the external gRPC client's injector.
+pub(crate) async fn scope_backend_metadata<F>(
+    metadata: Vec<(String, String)>,
+    future: F,
+) -> F::Output
+where
+    F: Future,
+{
+    FORWARDED_BACKEND_METADATA.scope(metadata, future).await
+}
+
+fn inject_forwarded_backend_metadata(metadata: &mut MetadataMap) {
+    let _ = FORWARDED_BACKEND_METADATA.try_with(|entries| {
+        for (key, value) in entries {
+            if metadata.get(key.as_str()).is_some() {
+                continue;
+            }
+            if let (Ok(key), Ok(value)) = (
+                MetadataKey::from_bytes(key.as_bytes()),
+                MetadataValue::try_from(value.as_str()),
+            ) {
+                metadata.insert(key, value);
+            }
+        }
+    });
+}
 
 #[inline]
 fn get_allowed_targets() -> &'static [&'static str; 3] {
@@ -274,6 +334,42 @@ impl smg_grpc_client::TraceInjector for OtelTraceInjector {
         metadata: &mut MetadataMap,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         inject_trace_context_grpc(metadata);
+        inject_forwarded_backend_metadata(metadata);
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use smg_grpc_client::TraceInjector as _;
+
+    use super::*;
+
+    #[tokio::test]
+    async fn forwards_only_allowlisted_request_metadata() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "x-morphosis-program-id",
+            HeaderValue::from_static("program-1"),
+        );
+        headers.insert("x-morphosis-agent-id", HeaderValue::from_static("agent-1"));
+        headers.insert("x-morphosis-program-end", HeaderValue::from_static("true"));
+        headers.insert(
+            "traceparent",
+            HeaderValue::from_static("00-00000000000000000000000000000001-0000000000000001-01"),
+        );
+        headers.insert("authorization", HeaderValue::from_static("secret"));
+
+        let forwarded = forwarded_backend_metadata(Some(&headers));
+        scope_backend_metadata(forwarded, async {
+            let mut metadata = MetadataMap::new();
+            OtelTraceInjector.inject(&mut metadata).unwrap();
+            assert_eq!(metadata.get("x-morphosis-program-id").unwrap(), "program-1");
+            assert_eq!(metadata.get("x-morphosis-agent-id").unwrap(), "agent-1");
+            assert_eq!(metadata.get("x-morphosis-program-end").unwrap(), "true");
+            assert!(metadata.get("traceparent").is_some());
+            assert!(metadata.get("authorization").is_none());
+        })
+        .await;
     }
 }

@@ -689,6 +689,9 @@ pub fn build_app(
         ))
         .layer(middleware::RequestIdLayer::new(request_id_headers))
         .layer(create_cors_layer(cors_allowed_origins))
+        .layer(axum::middleware::from_fn(
+            middleware::ingress_timing_middleware,
+        ))
         .fallback(sink_handler)
         .with_state(app_state)
 }

@@ -33,6 +33,7 @@ use crate::{
         metrics::{method_to_static_str, metrics_labels, Metrics},
     },
     routers::error::extract_error_code_from_response,
+    routers::grpc::context::scope_http_ingress,
     server::AppState,
     wasm::{
         module::{MiddlewareAttachPoint, WasmModuleAttachPoint},
@@ -45,6 +46,11 @@ use crate::{
         types::WasmComponentInput,
     },
 };
+
+/// Start the frontend-residence clock before body extraction and route-local queues.
+pub async fn ingress_timing_middleware(request: Request, next: Next) -> Response {
+    scope_http_ingress(Instant::now(), next.run(request)).await
+}
 
 /// A body wrapper that holds a token and returns it when the body is fully consumed or dropped.
 /// This ensures that for streaming responses, the token is only returned after the entire

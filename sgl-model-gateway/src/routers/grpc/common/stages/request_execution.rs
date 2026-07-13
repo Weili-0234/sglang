@@ -2,9 +2,11 @@
 
 use async_trait::async_trait;
 use axum::response::Response;
-use tracing::{error, info_span, Instrument};
+use std::time::{SystemTime, UNIX_EPOCH};
+use tracing::{error, info, info_span, Instrument};
 
 use super::PipelineStage;
+use crate::observability::otel_trace::{forwarded_backend_metadata, scope_backend_metadata};
 use crate::routers::{
     error,
     grpc::{
@@ -40,6 +42,7 @@ impl RequestExecutionStage {
 #[async_trait]
 impl PipelineStage for RequestExecutionStage {
     async fn execute(&self, ctx: &mut RequestContext) -> Result<Option<Response>, Response> {
+        let backend_metadata = forwarded_backend_metadata(ctx.input.headers.as_ref());
         let proto_request = ctx.state.proto_request.take().ok_or_else(|| {
             error!(
                 function = "RequestExecutionStage::execute",
@@ -87,6 +90,22 @@ impl PipelineStage for RequestExecutionStage {
             .as_ref()
             .map(|d| d.model.as_str())
             .unwrap_or("unknown");
+        let pre_backend_wall_time_ns = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|duration| duration.as_nanos() as u64)
+            .unwrap_or_default();
+
+        info!(
+            target: "smg::router-overhead",
+            event = "pre_backend_dispatch",
+            request_id = %request_id,
+            model = %model,
+            render_us = ctx.state.timings.render.map(|v| v.as_micros() as u64).unwrap_or_default(),
+            tokenize_us = ctx.state.timings.tokenize.map(|v| v.as_micros() as u64).unwrap_or_default(),
+            smg_pre_backend_us = ctx.input.ingress.elapsed().as_micros() as u64,
+            input_tokens = ctx.state.preparation.as_ref().map(|p| p.token_ids.len()).unwrap_or_default(),
+            pre_backend_wall_time_ns,
+        );
 
         // Create OTEL span for gRPC request execution
         let span = info_span!(
@@ -97,7 +116,7 @@ impl PipelineStage for RequestExecutionStage {
             mode = ?self.mode,
         );
 
-        let result = async {
+        let result = scope_backend_metadata(backend_metadata, async {
             match proto_request {
                 ProtoRequest::Generate(req) => match self.mode {
                     ExecutionMode::Single => self.execute_single(req, clients, workers).await,
@@ -107,7 +126,7 @@ impl PipelineStage for RequestExecutionStage {
                 },
                 ProtoRequest::Embed(req) => self.execute_single_embed(req, clients).await,
             }
-        }
+        })
         .instrument(span)
         .await?;
 

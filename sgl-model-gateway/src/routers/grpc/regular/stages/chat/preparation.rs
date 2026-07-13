@@ -1,6 +1,6 @@
 //! Chat preparation stage: Filter tools, process messages, tokenize, build constraints
 
-use std::borrow::Cow;
+use std::{borrow::Cow, time::Instant};
 
 use async_trait::async_trait;
 use axum::response::Response;
@@ -51,6 +51,7 @@ impl ChatPreparationStage {
         let body_ref = utils::filter_chat_request_by_tool_choice(request);
 
         // Step 2: Process messages and apply chat template
+        let render_start = Instant::now();
         let processed_messages = match utils::process_chat_messages(&body_ref, &*tokenizer) {
             Ok(msgs) => msgs,
             Err(e) => {
@@ -58,8 +59,10 @@ impl ChatPreparationStage {
                 return Err(error::bad_request("process_messages_failed", e));
             }
         };
+        ctx.state.timings.render = Some(render_start.elapsed());
 
         // Step 3: Tokenize the processed text (no special tokens - chat template already handles them)
+        let tokenize_start = Instant::now();
         let encoding = match tokenizer.encode(&processed_messages.text, false) {
             Ok(encoding) => encoding,
             Err(e) => {
@@ -70,6 +73,7 @@ impl ChatPreparationStage {
                 ));
             }
         };
+        ctx.state.timings.tokenize = Some(tokenize_start.elapsed());
 
         let token_ids = encoding.token_ids().to_vec();
 

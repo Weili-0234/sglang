@@ -4,9 +4,30 @@
 //! eliminating deep parameter passing chains and providing a single source of truth
 //! for request state.
 
-use std::sync::Arc;
+use std::{
+    future::Future,
+    sync::Arc,
+    time::{Duration, Instant},
+};
 
 use axum::http::HeaderMap;
+
+tokio::task_local! {
+    static HTTP_INGRESS: Instant;
+}
+
+pub(crate) async fn scope_http_ingress<F>(ingress: Instant, future: F) -> F::Output
+where
+    F: Future,
+{
+    HTTP_INGRESS.scope(ingress, future).await
+}
+
+fn http_ingress_or_now() -> Instant {
+    HTTP_INGRESS
+        .try_with(|ingress| *ingress)
+        .unwrap_or_else(|_| Instant::now())
+}
 
 use super::{
     client::GrpcClient,
@@ -42,6 +63,7 @@ pub(crate) struct RequestInput {
     pub request_type: RequestType,
     pub headers: Option<HeaderMap>,
     pub model_id: Option<String>,
+    pub ingress: Instant,
 }
 
 /// Request type variants
@@ -90,6 +112,15 @@ pub(crate) struct ProcessingState {
 
     // Stage 6: Response processing state
     pub response: ResponseState,
+
+    // V2 pre-engine overhead attribution.
+    pub timings: RequestTimings,
+}
+
+#[derive(Default)]
+pub(crate) struct RequestTimings {
+    pub render: Option<Duration>,
+    pub tokenize: Option<Duration>,
 }
 
 /// Output from preparation stage (Step 1)
@@ -210,6 +241,7 @@ impl RequestContext {
                 request_type: RequestType::Chat(request),
                 headers,
                 model_id,
+                ingress: http_ingress_or_now(),
             },
             components,
             state: ProcessingState::default(),
@@ -228,6 +260,7 @@ impl RequestContext {
                 request_type: RequestType::Generate(request),
                 headers,
                 model_id,
+                ingress: http_ingress_or_now(),
             },
             components,
             state: ProcessingState::default(),
@@ -246,6 +279,7 @@ impl RequestContext {
                 request_type: RequestType::Responses(request),
                 headers,
                 model_id,
+                ingress: http_ingress_or_now(),
             },
             components,
             state: ProcessingState::default(),
@@ -264,6 +298,7 @@ impl RequestContext {
                 request_type: RequestType::Embedding(request),
                 headers,
                 model_id,
+                ingress: http_ingress_or_now(),
             },
             components,
             state: ProcessingState::default(),
@@ -282,6 +317,7 @@ impl RequestContext {
                 request_type: RequestType::Classify(request),
                 headers,
                 model_id,
+                ingress: http_ingress_or_now(),
             },
             components,
             state: ProcessingState::default(),
@@ -345,6 +381,21 @@ impl RequestContext {
     /// The tokenizer is resolved once in the preparation stage and cached for reuse.
     pub fn tokenizer_arc(&self) -> Option<Arc<dyn Tokenizer>> {
         self.state.tokenizer.clone()
+    }
+}
+
+#[cfg(test)]
+mod ingress_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn scoped_http_ingress_survives_until_context_construction() {
+        let ingress = Instant::now();
+        scope_http_ingress(ingress, async {
+            tokio::task::yield_now().await;
+            assert_eq!(http_ingress_or_now(), ingress);
+        })
+        .await;
     }
 }
 

@@ -70,6 +70,25 @@ class TestSchedulePolicy(CustomTestCase):
         )
         self.assertEqual(policy.policy, CacheAgnosticPolicy.FCFS)
 
+    def test_req_normalizes_list_input_ids_for_array_sequence_paths(self):
+        req = Req("r1", "", [1, 2], SamplingParams())
+        req.output_ids.append(3)
+        req._refresh_fill_ids()
+        policy = SchedulePolicy(
+            policy="lpm",
+            tree_cache=self.tree_cache,
+            enable_hierarchical_cache=True,
+            enable_priority_scheduling=False,
+            schedule_low_priority_values_first=False,
+        )
+
+        policy.calc_priority([req])
+
+        self.assertIsInstance(req.origin_input_ids, array)
+        self.assertEqual(list(req.origin_input_ids), [1, 2])
+        self.assertEqual(list(req.output_ids), [3])
+        self.assertEqual(list(req.full_untruncated_fill_ids), [1, 2, 3])
+
     def test_calc_priority_fcfs(self):
         tree_cache = RadixCache.create_simulated()
         waiting_queue = [
